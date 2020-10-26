@@ -42,7 +42,7 @@ class OE300Base(Instrument):
         self.add_parameter('prefactor',
                            label='Prefactor',
                            parameter_class=ManualParameter,
-                           units=None,
+                           unit=None,
                            initial_value=prefactor)
 
         if cal_path:
