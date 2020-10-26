@@ -1,7 +1,7 @@
 try:
     import nidaqmx
     from nidaqmx import constants
-    from nidaqmx.constants import Edge, AcquisitionType, TerminalConfiguration, AcquisitionType, RegenerationMode
+    from nidaqmx.constants import Edge, AcquisitionType, TerminalConfiguration, AcquisitionType, RegenerationMode, TaskMode
 except ImportError:
     raise ImportError('Could not find nidaqmx module.')
 
@@ -14,6 +14,8 @@ from typing import Tuple
 
 from functools import partial
 import numpy as np
+
+import time
 
 
 ADC_pipeline_samps = {
@@ -37,6 +39,15 @@ def trajectory(b, a, vel, dt):
     N = np.ceil(dist(b,a)/vel/dt)
     if N < 2:
         N=2
+    return np.require(np.linspace(a, b, N).T, requirements=["C_CONTIGUOUS", "WRITEABLE"])
+
+
+def trajectory_1D(b, a, vel, dt):
+    N = np.ceil(np.abs(b-a)/vel/dt)
+    if N < 2:
+        N=2
+    if N % 2: #device does not like odd numbers of samples
+        N += 1
     return np.require(np.linspace(a, b, N).T, requirements=["C_CONTIGUOUS", "WRITEABLE"])
 
 
@@ -508,6 +519,7 @@ class PXI_6251(Instrument):
     def add_task(self, taskname):
         task = NIDAQ_Task(self, taskname)
         self.add_submodule(taskname, task)
+        return task
 
     def close_task(self, taskname):
         self.submodules[taskname]._task.close()
@@ -522,7 +534,7 @@ class MetaXYScannerDriver(Instrument):
     Requires nidaqmx module to be installed (pip install nidaqmx).
     """
 
-    def __init__(self, name: str, daq_card_name: str, xy_channel_names: Tuple[str, str],
+    def __init__(self, name: str, daq_card_instr: Instrument, xy_channel_names: Tuple[str, str],
                  clock_rate:float, scan_speed_V_per_s:float, **kwargs):
         """
         Create an instance of the instrument.
@@ -536,18 +548,18 @@ class MetaXYScannerDriver(Instrument):
 
         super().__init__(name, **kwargs)
 
-        self._daq_card = PXI_6251(daq_card_name, **kwargs)
+        self._daq_card = daq_card_instr #PXI_6251(daq_card_name, daq_card_name, **kwargs)
 
-        self._daq_card.add_task("ao_task")
+        self._ao_task = self._daq_card.add_task(f"ao_task_{name}")
 
-        self._daq_card.ao_task.add_ao_volt_channel('X', xy_channel_names[0])
-        self._daq_card.ao_task.add_ao_volt_channel('Y', xy_channel_names[1])
+        self._ao_task.add_ao_volt_channel('X', xy_channel_names[0])
+        self._ao_task.add_ao_volt_channel('Y', xy_channel_names[1])
 
-        self._daq_card.ao_task._task.out_stream.regen_mode = RegenerationMode.DONT_ALLOW_REGENERATION
+        self._ao_task._task.out_stream.regen_mode = RegenerationMode.DONT_ALLOW_REGENERATION
 
-        self._daq_card.ao_task.add_sample_clock(clock_rate, sample_mode=AcquisitionType.FINITE)
+        self._ao_task.add_sample_clock(clock_rate, sample_mode=AcquisitionType.FINITE)
 
-        self._daq_card.ao_task._task.register_done_event(self.task_done_callback)
+        self._ao_task._task.register_done_event(self.task_done_callback)
 
         self._pos = (None, None)
         self._target_pos = (None, None)
@@ -555,32 +567,32 @@ class MetaXYScannerDriver(Instrument):
         self.add_parameter(name='x_min',
                            label='x min value',
                            unit='V',
-                           set_cmd=self._daq_card.ao_task.X.ao_min.set,
-                           get_cmd=self._daq_card.ao_task.X.ao_min.get,
+                           set_cmd=self._ao_task.X.ao_min.set,
+                           get_cmd=self._ao_task.X.ao_min.get,
                            vals=vals.Numbers()
                            )
 
         self.add_parameter(name='x_max',
                            label='x max value',
                            unit='V',
-                           set_cmd=self._daq_card.ao_task.X.ao_max.set,
-                           get_cmd=self._daq_card.ao_task.X.ao_max.get,
+                           set_cmd=self._ao_task.X.ao_max.set,
+                           get_cmd=self._ao_task.X.ao_max.get,
                            vals=vals.Numbers()
                            )
 
         self.add_parameter(name='y_min',
                            label='y min value',
                            unit='V',
-                           set_cmd=self._daq_card.ao_task.Y.ao_min.set,
-                           get_cmd=self._daq_card.ao_task.Y.ao_min.get,
+                           set_cmd=self._ao_task.Y.ao_min.set,
+                           get_cmd=self._ao_task.Y.ao_min.get,
                            vals=vals.Numbers()
                            )
 
         self.add_parameter(name='y_max',
                            label='y max value',
                            unit='V',
-                           set_cmd=self._daq_card.ao_task.Y.ao_max.set,
-                           get_cmd=self._daq_card.ao_task.Y.ao_max.get,
+                           set_cmd=self._ao_task.Y.ao_max.set,
+                           get_cmd=self._ao_task.Y.ao_max.get,
                            vals=vals.Numbers()
                            )
 
@@ -595,23 +607,23 @@ class MetaXYScannerDriver(Instrument):
         self.add_parameter(name='samp_rate',
                            label='sampling rate',
                            unit='samples/s',
-                           set_cmd=self._daq_card.ao_task.clock.samp_clk_rate.set,
-                           get_cmd=self._daq_card.ao_task.clock.samp_clk_rate.get,
-                           vals=vals.Numbers(min_value=0, max_value=self._daq_card.ao_task._task.timing.samp_clk_max_rate)
+                           set_cmd=self._ao_task.clock.samp_clk_rate.set,
+                           get_cmd=self._ao_task.clock.samp_clk_rate.get,
+                           vals=vals.Numbers(min_value=0, max_value=self._ao_task._task.timing.samp_clk_max_rate)
                            )
         
         self.add_parameter(name='N_samp',
                            label='N samples',
                            unit='',
-                           set_cmd=self._daq_card.ao_task.clock.samp_quant_samp_per_chan.set,
-                           get_cmd=self._daq_card.ao_task.clock.samp_quant_samp_per_chan.get,
+                           set_cmd=self._ao_task.clock.samp_quant_samp_per_chan.set,
+                           get_cmd=self._ao_task.clock.samp_quant_samp_per_chan.get,
                            vals=vals.Ints(min_value=0)
                            )
 
     def go_to(self, pos: Tuple[float, float]):
         self.N_samp.set(2)
-        self._daq_card.ao_task.write([[pos[0],]*2,[pos[1],]*2], auto_start=False)   # weird behavior of daq card with List instead of List[List] input to write
-        self._daq_card.ao_task.start()
+        self._ao_task.write([[pos[0],]*2,[pos[1],]*2], auto_start=False)   # weird behavior of daq card with List instead of List[List] input to write
+        self._ao_task.start()
         self._target_pos = pos      
 
     def go_to_smooth(self, pos: Tuple[float, float]):
@@ -619,9 +631,11 @@ class MetaXYScannerDriver(Instrument):
             self.go_to(pos)
         else:
             traj = trajectory(pos, self._pos, self.scan_speed(), 1/self.samp_rate())
+            self.log.info(f"traj with shape {traj.shape}")
             self.N_samp.set(traj.shape[1])
-            self._daq_card.ao_task.write(traj, auto_start=False)
-            self._daq_card.ao_task.start()
+            self.log.info(f"task setup with {self.N_samp.get()} samples.")
+            self._ao_task.write(traj, auto_start=False)
+            self._ao_task.start()
             self._target_pos = pos
 
     def scan_init(self, Vx_list, Vy_list):
@@ -629,6 +643,8 @@ class MetaXYScannerDriver(Instrument):
             self.go_to((min(Vx_list), min(Vy_list)))
         else:
             self.go_to_smooth((min(Vx_list), min(Vy_list)))
+
+        time.sleep(0.01)    
         while not self.is_done_moving():
             pass
 
@@ -649,10 +665,11 @@ class MetaXYScannerDriver(Instrument):
             pass
 
     def is_done_moving(self):
-        return self._daq_card.ao_task._task.is_task_done() and self._pos == self._target_pos
+        return self._ao_task._task.is_task_done() and self._pos == self._target_pos
 
     def task_done_callback(self, task_handle, status, callback_data):
-        self._daq_card.ao_task.stop()
+        self._ao_task.stop()
+        self._ao_task._task.control(TaskMode.TASK_UNRESERVE)
         self._pos = self._target_pos
         return 0
         
@@ -660,4 +677,126 @@ class MetaXYScannerDriver(Instrument):
         return self._daq_card.ao_task.stop()
     
 
+class MetaZScannerDriver(Instrument):
+    """
+    QCoDeS meta driver creating a Z scanner driver using 1 analog output from an NI PXI 6251 DAQ card.
+
+    Requires nidaqmx module to be installed (pip install nidaqmx).
+    """
+
+    def __init__(self, name: str, daq_card_instr: Instrument, z_channel_name: str,
+                 clock_rate:float, scan_speed_V_per_s:float, **kwargs):
+        """
+        Create an instance of the instrument.
+
+        Args:
+            name (str): The internal QCoDeS name of the instrument
+            daq_card_name (str): The device name from the list
+                system = nidaqmx.system.System.local()
+                [device.name for device in system.devices]
+        """
+
+        super().__init__(name, **kwargs)
+
+        self._daq_card = daq_card_instr
+
+        self._ao_task = self._daq_card.add_task(f"ao_task_{name}")
+
+        self._ao_task.add_ao_volt_channel('Z', z_channel_name)
+
+        self._ao_task._task.out_stream.regen_mode = RegenerationMode.DONT_ALLOW_REGENERATION
+
+        self._ao_task.add_sample_clock(clock_rate, sample_mode=AcquisitionType.FINITE)
+
+        self._ao_task._task.register_done_event(self.task_done_callback)
+
+        self._pos = None
+        self._target_pos = None
+
+        self.add_parameter(name='z_min',
+                           label='z min value',
+                           unit='V',
+                           set_cmd=self._ao_task.Z.ao_min.set,
+                           get_cmd=self._ao_task.Z.ao_min.get,
+                           vals=vals.Numbers()
+                           )
+
+        self.add_parameter(name='z_max',
+                           label='z max value',
+                           unit='V',
+                           set_cmd=self._ao_task.Z.ao_max.set,
+                           get_cmd=self._ao_task.Z.ao_max.get,
+                           vals=vals.Numbers()
+                           )
+
+        self.add_parameter(name='scan_speed',
+                           parameter_class=ManualParameter,
+                           initial_value=scan_speed_V_per_s,
+                           label='scanning speed',
+                           unit='V_per_s',
+                           vals=vals.MultiType(vals.Numbers(), vals.Enum(None))
+                           )
+
+        self.add_parameter(name='samp_rate',
+                           label='sampling rate',
+                           unit='samples/s',
+                           set_cmd=self._ao_task.clock.samp_clk_rate.set,
+                           get_cmd=self._ao_task.clock.samp_clk_rate.get,
+                           vals=vals.Numbers(min_value=0, max_value=self._ao_task._task.timing.samp_clk_max_rate)
+                           )
+        
+        self.add_parameter(name='N_samp',
+                           label='N samples',
+                           unit='',
+                           set_cmd=self._ao_task.clock.samp_quant_samp_per_chan.set,
+                           get_cmd=self._ao_task.clock.samp_quant_samp_per_chan.get,
+                           vals=vals.Ints(min_value=0)
+                           )
+
+    def go_to(self, pos: float):
+        self.N_samp.set(2)
+        self._ao_task.write([pos,]*2, auto_start=False)   # weird behavior of daq card with List instead of List[List] input to write
+        self._ao_task.start()
+        self._target_pos = pos      
+
+    def go_to_smooth(self, pos: float):
+        if self.scan_speed() is None or self._pos is None:
+            self.go_to(pos)
+        else:
+            if not (pos == self._pos):
+                traj = trajectory_1D(pos, self._pos, self.scan_speed(), 1/self.samp_rate())
+                self.log.info(f"traj with shape {traj.shape}")
+                self.N_samp.set(traj.shape[0])
+                self.log.info(f"task setup with {self.N_samp.get()} samples.")
+                self._ao_task.write(traj, auto_start=False)
+                self._ao_task.start()
+                self._target_pos = pos
+
+    def scan_init(self, Vz_list):
+        if self._pos == None:
+            self.go_to(min(Vz_list))
+        else:
+            self.go_to_smooth(min(Vz_list))
+        while not self.is_done_moving():
+            pass
+
+        self.go_to_smooth(max(Vz_list))
+        while not self.is_done_moving():
+            pass
+
+        self.go_to_smooth(min(Vz_list))
+        while not self.is_done_moving():
+            pass
+
+    def is_done_moving(self):
+        return self._ao_task._task.is_task_done() and self._pos == self._target_pos
+
+    def task_done_callback(self, task_handle, status, callback_data):
+        self._ao_task.stop()
+        self._ao_task._task.control(TaskMode.TASK_UNRESERVE)
+        self._pos = self._target_pos
+        return 0
+        
+    def stop(self):
+        return self._ao_task.stop()
 
